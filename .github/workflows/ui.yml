@@ -1,0 +1,42 @@
+name: UI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    # A passing run takes about 30 s; the limit ends a hang.
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: ts/oneberth-ui
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: ts/oneberth-ui/.nvmrc
+          cache: npm
+          cache-dependency-path: ts/oneberth-ui/package-lock.json
+      - run: npm ci
+      # Advisories and registry signatures for everything installed. The
+      # package ships no dependency of its own, so there is nothing to narrow
+      # the check to: with --omit=dev npm finds nothing to audit and fails.
+      - name: Known advisories, and registry signatures
+        run: |
+          npm audit
+          npm audit signatures
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - name: The package's gate, over its peers, its files and its size budget
+        run: npm run build
+      - name: The bundled-package list is committed as the gate wrote it
+        run: git diff --exit-code -- bundled-packages.txt
