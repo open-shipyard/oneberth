@@ -14,7 +14,9 @@ It ships two packages:
 
 - The identity core, `oneberth.identity`: users, the four kinds of credential, device
   pairing, the allow list, roles and the decision of a permission. It runs on a store
-  port, with a memory store and the store's contract suite.
+  port, with a memory store and the store's contract suite. A service token is created
+  and revoked by the operator, by the launch secret, or by an admin from a browser
+  session. A bearer of that admin creates and revokes none.
 - The stores: `oneberth.identity.postgres`, in the PostgreSQL schema `oneberth`, and
   `oneberth.identity.sqlite`, in the file `oneberth.db`. Both pass the contract suite.
   `oneberth.stores.opened_store` opens either for a backend. Its `schema` names
@@ -33,8 +35,11 @@ It ships two packages:
 - The web part, `oneberth.web`, in the extra `oneberth[web]`. An application gives
   a `Component`: its name, its roles, a FastAPI router whose routes each declare a
   permission with `permit`, and what it starts and stops. A route declares one
-  permit, on itself or on an `include_router` call above it. A component may also
-  check the service tokens of its roles before oneberth creates them.
+  permit, on itself or on an `include_router` call above it. A route that names
+  no resource refuses a grant bound to one, such as a worker's to its queue. A
+  permit with `bound=True` passes that grant: the route then acts on the grant's
+  own resource. A component may also check the service tokens of its roles
+  before oneberth creates them.
   `compose_app` composes components into a backend's web application. It serves
   the `/auth` routes, the interface under `/ui/` and `/health`, and checks who is
   asking before a handler runs. `serve` runs the result on uvicorn, with a front
@@ -82,12 +87,16 @@ It ships two packages:
   launcher creates two networks: `app`, for the backend and the trusted
   workers, and `sandbox`, which has no way out, for the backend and the
   untrusted workers. A container on `sandbox` reaches the worker listener
-  alone. Both listeners are published on the host's loopback address. An
-  untrusted worker runs in a container, and gets its token, the worker
-  listener's address and what its description names. The launcher runs the
-  `docker` command, and refuses to start while Docker is not running. A stop
-  removes the containers and the networks. A start first removes what a
-  crashed start left on the same data directory.
+  alone: the front listener binds the backend's address on `app`, and
+  `sandbox` has no route to the host. Both listeners are published on the
+  host's loopback address. An untrusted worker runs in a container, and gets
+  its token and the worker listener's address. It mounts its own directory,
+  `workers/<name>` in the data directory, or a directory inside it: the
+  launcher refuses any other path of the host, and a link that leads out of
+  that directory. The launcher runs the `docker` command, and refuses to
+  start while Docker is not running. A stop removes the containers and the
+  networks. A start first removes what a crashed start left on the same data
+  directory.
 
 ## Provenance
 
