@@ -23,7 +23,7 @@ A shape decides who starts a component, where it listens and where the data live
 | level | who | holds | reaches |
 |---|---|---|---|
 | trusted | the backend, the manager, the scheduler, the launcher | the database, the operator's secrets | everything |
-| trusted worker | a worker that runs the project's own code | a token, and the keys its engines need | the worker listener, the model providers, the tool servers |
+| trusted worker | a worker that runs the project's own code | a token, and the keys its engines need | the worker listener, the front listener, the model providers, the tool servers |
 | untrusted worker | a worker that runs code nobody reviewed, such as code an agent writes | a token, and fake keys | the worker listener; the model providers, through the egress proxy |
 
 An untrusted worker follows these rules:
@@ -35,7 +35,12 @@ An untrusted worker follows these rules:
 - It reaches a model provider through the egress proxy. Its engines hold fake keys, and the
   proxy puts the real key in the place of each.
 - The egress proxy passes a call on to the model providers alone.
-- It keeps its engines' state in storage of its own.
+- It has no route to the front listener.
+- It keeps its engines' state in a directory of its own: `workers/<name>` in the data directory.
+- That directory is all it sees of the host. It mounts the directory or a directory inside
+  it, and nothing else: not the data directory, the window's profile, another worker's
+  directory, a path outside the data directory or the Docker socket.
+- A link inside that directory that leads out of it stops the start.
 
 A token limits every worker, trusted or not. The network is the second limit.
 
@@ -99,6 +104,14 @@ and the egress proxy alone.
 The egress proxy is on both networks. The launcher starts it when the configuration names
 an untrusted worker.
 
+A container on `sandbox` has no route to the front listener:
+
+- The backend binds its front listener to its address on `app` alone. It binds its worker
+  listener on both networks.
+- `sandbox` has no route to the host. The two listeners published on the host's loopback
+  address are out of its reach.
+- A container on `sandbox` gets no name for the host's gateway.
+
 ```mermaid
 flowchart LR
     subgraph host
@@ -125,8 +138,8 @@ flowchart LR
 ```
 
 A service on the host's loopback address, such as a local tool server or a local model, is
-outside the container. The backend and its workers reach it through the
-host's gateway name.
+outside the containers. The backend and the trusted workers' containers reach it through
+the host's gateway name. An untrusted worker reaches no service of the host.
 
 ## A worker in a VM
 
@@ -175,7 +188,7 @@ The launch secret, the tokens and the session of a start end at the stop.
 | Robinauts' records | schema `robinauts` | `robinauts.db` |
 | neorc's records | schema `neorc` | `neorc.db` |
 | oneberth's store | schema `oneberth` | `oneberth.db` |
-| an engine's state | the engine's tables | a folder per worker |
+| an engine's state | the engine's tables | `workers/<name>`, a folder per worker |
 
 - The backend's process alone opens the SQLite files.
 - The manager on PostgreSQL tells waiting workers about a new task through the database's
@@ -187,7 +200,7 @@ The launch secret, the tokens and the session of a start end at the stop.
 
 ## Details likely to change
 
-- The names of the networks and of the database files.
+- The names of the networks, of the database files and of the workers' directory.
 - The list of browsers the launcher looks for.
 - Where the data directory is on each operating system.
 

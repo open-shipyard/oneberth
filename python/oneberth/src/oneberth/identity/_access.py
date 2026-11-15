@@ -140,7 +140,8 @@ class Principal:
 
     @property
     def is_browser_session(self) -> bool:
-        """A session sent as a cookie: what mints and removes a person's credentials."""
+        """A session sent as a cookie: what mints and removes a person's
+        credentials, and what an admin creates and revokes service tokens with."""
         return self.credential.kind is CredentialKind.SESSION and not self.bearer
 
     @property
@@ -609,20 +610,33 @@ class Access:
                 del self._checks[stale]
 
     def allows(
-        self, principal: Principal, permission: str, resource: str | None = None
+        self,
+        principal: Principal,
+        permission: str,
+        resource: str | None = None,
+        *,
+        bound: bool = False,
     ) -> bool:
         """Whether ``principal`` holds ``permission`` on ``resource``.
 
-        ``resource`` is ``None`` for a request that names none
-        (``Registry.allows``).
+        ``resource`` is ``None`` for a request that names none: a grant bound
+        to one resource then holds only with ``bound``, for a request that
+        acts on that grant's own resource (``Registry.allows``).
         """
-        return self._registry.allows(principal.grants, permission, resource)
+        return self._registry.allows(
+            principal.grants, permission, resource, bound=bound
+        )
 
     def authorize(
-        self, principal: Principal, permission: str, resource: str | None = None
+        self,
+        principal: Principal,
+        permission: str,
+        resource: str | None = None,
+        *,
+        bound: bool = False,
     ) -> None:
         """Raise ``PermissionDeniedError`` unless ``principal`` holds ``permission``."""
-        if not self.allows(principal, permission, resource):
+        if not self.allows(principal, permission, resource, bound=bound):
             on = "" if resource is None else f" on {resource!r}"
             raise PermissionDeniedError(f"{principal.name} may not {permission}{on}")
 
@@ -673,8 +687,10 @@ class Access:
         """The one resource ``principal`` may use ``permission`` on, such as a
         worker's queue; ``None`` when it may use it on every resource.
 
-        Raises ``PermissionDeniedError`` when it may not use it at all, or when
-        its grants name several resources, so the request must name one.
+        A route that asked ``authorize`` with ``bound`` confines its request
+        to this resource. Raises ``PermissionDeniedError`` when the principal
+        may not use the permission at all, or when its grants name several
+        resources, so the request must name one.
         """
         holds, resource = self._registry.bound_resource(principal.grants, permission)
         if not holds:
@@ -827,11 +843,35 @@ class Access:
 
     # Service tokens.
 
-    def _managing(self, by: Principal | Operator) -> None:
+    def _may_list(self, by: Principal | Operator) -> None:
+        """Raise ``PermissionDeniedError`` unless ``by`` is the operator or
+        holds ``oneberth/tokens:manage``. That is enough to list the service
+        tokens, with any credential: a list shows no secret."""
         if isinstance(by, Operator):
             return
         if not self.allows(by, TOKENS_MANAGE):
             raise PermissionDeniedError(f"{by.name} may not manage service tokens")
+
+    def _may_change(self, by: Principal | Operator, *, fresh: bool) -> None:
+        """Raise unless ``by`` may create or revoke a service token
+        (identity.md, "Service tokens").
+
+        The operator may, at the command line, and the launch secret may, in
+        the local mode. A person with ``oneberth/tokens:manage`` may from
+        their browser session alone; ``fresh`` asks for a session younger than
+        ``FRESH_SIGN_IN``, as a mint does. Every other bearer is refused with
+        ``BearerRefusedError``, whatever its roles: a personal token, a device
+        session, and a session another backend forwards.
+        """
+        self._may_list(by)
+        if isinstance(by, Operator) or self._is_launcher(by):
+            return
+        if not by.is_browser_session:
+            raise BearerRefusedError(
+                "service tokens are created and revoked from an admin's browser "
+                "session, not with a bearer"
+            )
+        self.require_browser(by, fresh=fresh)
 
     async def create_service_token(
         self,
@@ -844,13 +884,16 @@ class Access:
     ) -> tuple[str, ServiceToken]:
         """A new service token and its secret, which is shown once.
 
-        ``by`` holds ``oneberth/tokens:manage``, or is the ``OPERATOR``. A
-        token the launcher mints is kept in memory, and ends when the
-        application stops. A token holds a role that is not for people. The
-        application of the role then checks the token with its
-        ``ServiceTokenCheck``, if it gave one.
+        ``by`` is the ``OPERATOR``, the launch secret, or a person with
+        ``oneberth/tokens:manage`` in a browser session younger than
+        ``FRESH_SIGN_IN``; a bearer of that person is refused. A token the
+        launcher mints is kept in memory, and ends when the application
+        stops. A token holds a role that is not for people. The application
+        of the role then checks the token with its ``ServiceTokenCheck``, if
+        it gave one. Without ``expires_in``, the token lives until it is
+        revoked.
         """
-        self._managing(by)
+        self._may_change(by, fresh=True)
         grant = await self._checked_grant(name, role, resource, expires_in)
         now = self.now()
         if not isinstance(by, Operator) and self._is_launcher(by):
@@ -941,8 +984,11 @@ class Access:
         return secret, token
 
     async def service_tokens(self, *, by: Principal | Operator) -> list[ServiceToken]:
-        """Every service token, by name: the store's, and those kept in memory."""
-        self._managing(by)
+        """Every service token, by name: the store's, and those kept in memory.
+
+        ``by`` is the ``OPERATOR``, or holds ``oneberth/tokens:manage``.
+        """
+        self._may_list(by)
         stored = await self._store.service_tokens()
         held = list(self._in_memory.values())
         return sorted([*stored, *held], key=lambda token: (token.name, token.id))
@@ -950,7 +996,11 @@ class Access:
     async def revoke_service_token(
         self, token_id: uuid.UUID, *, by: Principal | Operator
     ) -> None:
-        self._managing(by)
+        """End a service token. ``by`` is the ``OPERATOR``, the launch secret,
+        or a person with ``oneberth/tokens:manage`` in their browser session;
+        a bearer of that person is refused. Taking access away needs no fresh
+        sign-in."""
+        self._may_change(by, fresh=False)
         for hashed, token in list(self._in_memory.items()):
             if token.id == token_id:
                 del self._in_memory[hashed]
