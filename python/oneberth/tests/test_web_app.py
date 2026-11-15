@@ -6,9 +6,10 @@
 ``notes`` has a route of each kind the applications have: a plain answer, a
 write, a long poll, a stream, a route out of the OpenAPI document, a page with
 headers of its own, an error of its own. ``jobs`` has the routes of a worker,
-served on the worker listener too. A person signs in through the stand-in
-provider and uses every ``/auth`` route; the journey runs on the memory, the
-SQLite and the PostgreSQL stores.
+served on the worker listener too: one that names its queue, one that acts on
+the worker's own queue, and one that serves every queue. A person signs in
+through the stand-in provider and uses every ``/auth`` route; the journey runs
+on the memory, the SQLite and the PostgreSQL stores.
 """
 
 from __future__ import annotations
@@ -89,6 +90,8 @@ JOBS = RoleTable(
     roles=(
         Role("jobs/user", frozenset({"jobs/status:read"}), people=True),
         Role("jobs/worker", frozenset({"jobs/tasks:claim"}), resource="queue"),
+        # A service that works on every queue: its grant names none.
+        Role("jobs/dispatcher", frozenset({"jobs/tasks:claim"})),
     ),
     default="jobs/user",
 )
@@ -204,10 +207,16 @@ class Samples:
         async def claim(queue: str, principal: Asking) -> dict[str, str]:
             return {"queue": queue, "by": principal.name}
 
-        @router.get("/mine", dependencies=[permit("jobs/tasks:claim")])
+        # It names no queue, and acts on the one the worker's grant names.
+        @router.get("/mine", dependencies=[permit("jobs/tasks:claim", bound=True)])
         async def mine(request: Request, principal: Asking) -> dict[str, str | None]:
             access = request.app.state.oneberth.access
             return {"queue": access.bound_resource(principal, "jobs/tasks:claim")}
+
+        # It names no queue, and serves them all.
+        @router.get("/tasks", dependencies=[permit("jobs/tasks:claim")])
+        async def tasks() -> dict[str, str]:
+            return {"tasks": "of every queue"}
 
         @router.get("/status", dependencies=[permit("jobs/status:read")])
         async def status() -> dict[str, str]:
@@ -413,6 +422,7 @@ async def test_a_person_signs_in_and_uses_every_route_of_auth(
             assert roles == [
                 {"name": "notes/reader", "needs_resource": False},
                 {"name": "jobs/worker", "needs_resource": True},
+                {"name": "jobs/dispatcher", "needs_resource": False},
             ]
             made = await client.post(
                 "/auth/services",
@@ -546,6 +556,59 @@ async def test_a_credential_is_minted_from_a_session_younger_than_ten_minutes(
                 "FreshSignInRequired",
             )
         assert (await client.get("/auth/tokens")).json() == {"items": []}
+
+
+async def test_a_bearer_of_an_admin_creates_and_revokes_no_service_token(
+    samples: Samples, memory: MemoryIdentityStore
+) -> None:
+    config = config_for("notes", public_url=PUBLIC_URL, admins=["ada"])
+    composition = compose(samples, memory, config=config)
+    new = {"name": "stolen", "role": "notes/reader"}
+    async with running(composition) as client, client_of(composition) as script:
+        session = await signed_in(composition, client)
+        personal = (await client.post("/auth/tokens", json={"name": "t"})).json()
+        kept = (
+            await client.post("/auth/services", json={**new, "name": "kept"})
+        ).json()
+        # The admin's personal token, and the session as a backend forwards it.
+        for secret in (personal["secret"], session):
+            sent = bearer(secret)
+            made = await script.post("/auth/services", json=new, headers=sent)
+            revoked = await script.delete(f"/auth/services/{kept['id']}", headers=sent)
+            listed = await script.get("/auth/services", headers=sent)
+            for refused in (made, revoked):
+                assert (refused.status_code, refused.json()["error"]) == (
+                    403,
+                    "BearerRefused",
+                ), refused.text
+            assert [s["name"] for s in listed.json()["items"]] == ["kept"]
+        # The browser's session still revokes it.
+        gone = await client.delete(f"/auth/services/{kept['id']}")
+
+    assert gone.status_code == 204
+
+
+async def test_a_service_token_is_created_from_a_session_younger_than_ten_minutes(
+    samples: Samples, memory: MemoryIdentityStore
+) -> None:
+    clock = ManualClock()
+    config = config_for("notes", public_url=PUBLIC_URL, admins=["ada"])
+    composition = compose(samples, memory, config=config, clock=clock)
+    async with running(composition) as client:
+        await signed_in(composition, client)
+        made = await client.post(
+            "/auth/services", json={"name": "ci", "role": "notes/reader"}
+        )
+        clock.advance(timedelta(minutes=10))
+        stale = await client.post(
+            "/auth/services", json={"name": "late", "role": "notes/reader"}
+        )
+        # Taking access away needs no fresh sign-in.
+        revoked = await client.delete(f"/auth/services/{made.json()['id']}")
+
+    assert made.status_code == 201, made.text
+    assert (stale.status_code, stale.json()["error"]) == (403, "FreshSignInRequired")
+    assert revoked.status_code == 204
 
 
 async def test_a_secure_origin_sets_the_host_prefixed_cookie(
@@ -846,6 +909,7 @@ async def test_one_openapi_document_per_component(
         "/jobs/mine",
         "/jobs/queues/{queue}/claims",
         "/jobs/status",
+        "/jobs/tasks",
     ]
     assert (
         "/auth/tokens" in auth["paths"]
@@ -904,6 +968,35 @@ async def test_the_worker_listener_serves_the_routes_of_worker_roles_alone(
     assert claim.status_code == 200
     assert [a.status_code for a in (status, notes, auth)] == [404, 404, 404]
     assert health.json()["status"] == "ok"
+
+
+@pytest.mark.parametrize("on_worker_listener", [True, False])
+async def test_a_worker_of_one_queue_is_refused_a_route_that_serves_every_queue(
+    app: tuple[Composition, httpx.AsyncClient], on_worker_listener: bool
+) -> None:
+    composition, _ = app
+    worker = bearer(await service_token(composition, "jobs/worker", "gpu"))
+    dispatcher = bearer(await service_token(composition, "jobs/dispatcher"))
+    async with client_of(composition, worker=on_worker_listener) as client:
+        every = await client.get("/jobs/tasks", headers=worker)
+        mine = await client.get("/jobs/mine", headers=worker)
+        named = await client.post("/jobs/queues/gpu/claims", json={}, headers=worker)
+        every_queue = await client.get("/jobs/tasks", headers=dispatcher)
+        no_one_queue = await client.get("/jobs/mine", headers=dispatcher)
+
+    # The worker's grant holds on its queue alone: where a path names it, and
+    # where the route says it acts on the grant's own queue.
+    assert (every.status_code, every.json()["error"]) == (403, "Forbidden")
+    assert (mine.status_code, mine.json()) == (200, {"queue": "gpu"})
+    assert named.status_code == 200
+    # A grant for every queue passes both, and is confined to none.
+    assert every_queue.json() == {"tasks": "of every queue"}
+    assert no_one_queue.json() == {"queue": None}
+
+
+def test_a_route_takes_its_resource_from_its_path_or_from_the_grant() -> None:
+    with pytest.raises(ValueError, match="not from both"):
+        permit("jobs/tasks:claim", "queue", bound=True)
 
 
 # What compose_app refuses.
