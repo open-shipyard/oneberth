@@ -162,6 +162,13 @@ class Composition:
         """Where ``ticket`` signs the local user in: what the window opens."""
         return self._backend.ticket_url(ticket)
 
+    @property
+    def failure(self) -> ServerError | None:
+        """Why the last start failed: the component that did not start, with
+        its error's sentence, or the backend's own part, such as its store.
+        ``None`` for a start that did not fail."""
+        return self._started.failure
+
     def lifespan(self) -> AbstractAsyncContextManager[None]:
         """Start the backend and stop it at the end of the block."""
         return cast(
@@ -195,7 +202,8 @@ class Composition:
                         "component %s failed to begin serving", component.name
                     )
                     raise ServerError(
-                        f"component {component.name} failed to begin serving: {error}"
+                        f"component {component.name} failed to begin serving: "
+                        f"{_said(error)}"
                     ) from error
                 begun.append((component, moment))
                 log.info("component %s serves", component.name)
@@ -295,7 +303,7 @@ def compose_app(
     started = _Started()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    async def life(app: FastAPI) -> AsyncIterator[None]:
         async with AsyncExitStack() as stack:
             if callable(store):
                 opened = await stack.enter_async_context(store())
@@ -329,7 +337,13 @@ def compose_app(
             context = Context(access=access, config=config, public_url=public_url)
             for component in apps:
                 if component.lifespan is not None:
-                    await stack.enter_async_context(component.lifespan(context))
+                    try:
+                        await stack.enter_async_context(component.lifespan(context))
+                    except (Exception, SystemExit) as error:
+                        started.failure = _failure(
+                            f"component {component.name} failed to start", error
+                        )
+                        raise
                     log.info("component %s started", component.name)
             backend.access_or_none = access
             backend.providers = providers
@@ -341,6 +355,21 @@ def compose_app(
                 backend.access_or_none = None
                 backend.providers = None
         log.info("backend %s stopped", backend_name)
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        """The backend's life. It keeps why a start failed, for ``serve`` to
+        say: the server that runs the lifespan logs the error and passes none
+        of it on."""
+        started.failure = None
+        async with AsyncExitStack() as whole:
+            try:
+                await whole.enter_async_context(life(app))
+            except (Exception, SystemExit) as error:
+                if started.failure is None:
+                    started.failure = _failure("the backend did not start", error)
+                raise
+            yield
 
     front = _listener(apps, backend, lifespan)
     front.include_router(_auth.router)
@@ -402,9 +431,34 @@ def compose_app(
 
 @dataclass(slots=True)
 class _Started:
-    """What the lifespan of a running backend gives its components."""
+    """What the lifespan of a running backend gives its components, and why
+    its last start failed."""
 
     context: Context | None = None
+    failure: ServerError | None = None
+
+
+def _failure(what: str, error: BaseException) -> ServerError:
+    """``what``, with what ``error`` says, as ``serve`` raises it."""
+    failure = ServerError(f"{what}: {_said(error)}")
+    failure.__cause__ = error
+    return failure
+
+
+def _said(error: BaseException) -> str:
+    """What ``error`` says, for the server's last line.
+
+    An application's own error says its sentence. A builtin error is named by
+    its type first: its text is not written for a person, and a ``KeyError``'s
+    is its key alone. An error with no text is its type's name.
+    """
+    text = str(error).strip()
+    name = type(error).__name__
+    if not text:
+        return name
+    if type(error).__module__ == "builtins":
+        return f"{name}: {text}"
+    return text
 
 
 def _login_name() -> str | None:
